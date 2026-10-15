@@ -4,8 +4,15 @@ import io
 import logging
 import re
 import time
-from datetime import timedelta
+from datetime import datetime, timedelta, timezone
 from urllib.parse import urlparse
+
+from reportlab.lib import colors
+from reportlab.lib.enums import TA_LEFT
+from reportlab.lib.pagesizes import A4
+from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+from reportlab.lib.units import mm
+from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle
 
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, InputFile
 from telegram.constants import ParseMode
@@ -59,7 +66,7 @@ def remaining_text(seconds):
     minutes = rem // 60
     return f"{hours}h {minutes}m"
 
-def format_result(domain, whois_data, dns_data):
+def format_result(domain, whois_data, dns_data, requested_by=None, is_pro=False):
     fields = [
         ("🏢 Registrar", whois_data.get("registrar")),
         ("📅 Created", whois_data.get("creation_date")),
@@ -79,12 +86,179 @@ def format_result(domain, whois_data, dns_data):
         if len(display) > 700:
             display = display[:697] + "..."
         lines.append(f"<b>{kind}:</b> {html.escape(display)}")
+    if requested_by:
+        lines.append(f"\n👤 <b>Requested by:</b> {html.escape(requested_by)}")
+    if is_pro:
+        lines.append("💎 <b>PRO MEMBER</b>")
+    lines.append("\n<i>Powered by Jazib Ali Abbas</i>")
     return "\n".join(lines)
+
+def _pdf_value(value):
+    if value is None or value == "" or value == []:
+        return "Not available"
+    if isinstance(value, (list, tuple, set)):
+        return ", ".join(str(item) for item in list(value)[:20]) or "Not available"
+    return str(value)
+
+def build_pdf_report(domain, whois_data, dns_data, telegram_user, is_pro=False):
+    """Build a branded, modern PDF report in memory."""
+    buffer = io.BytesIO()
+    navy = colors.HexColor("#101B35")
+    teal = colors.HexColor("#00A6A6")
+    pale = colors.HexColor("#F2F6FA")
+    muted = colors.HexColor("#637083")
+    border = colors.HexColor("#DCE4ED")
+
+    doc = SimpleDocTemplate(
+        buffer, pagesize=A4,
+        rightMargin=18 * mm, leftMargin=18 * mm,
+        topMargin=22 * mm, bottomMargin=20 * mm,
+        title=f"WHOIS Report - {domain}",
+        author="Jazib Ali Abbas",
+        subject=f"WHOIS and DNS report for {domain}",
+    )
+    styles = getSampleStyleSheet()
+    styles.add(ParagraphStyle(
+        name="ReportTitle", parent=styles["Title"], fontName="Helvetica-Bold",
+        fontSize=23, leading=28, textColor=colors.white, alignment=TA_LEFT,
+        spaceAfter=4,
+    ))
+    styles.add(ParagraphStyle(
+        name="ReportSub", parent=styles["Normal"], fontName="Helvetica",
+        fontSize=9, leading=13, textColor=colors.HexColor("#D6E4F0"),
+    ))
+    styles.add(ParagraphStyle(
+        name="SectionHead", parent=styles["Heading2"], fontName="Helvetica-Bold",
+        fontSize=11, leading=14, textColor=navy, spaceBefore=10, spaceAfter=7,
+    ))
+    styles.add(ParagraphStyle(
+        name="Cell", parent=styles["BodyText"], fontName="Helvetica",
+        fontSize=8.5, leading=11, textColor=navy, wordWrap="CJK",
+    ))
+    styles.add(ParagraphStyle(
+        name="CellLabel", parent=styles["BodyText"], fontName="Helvetica-Bold",
+        fontSize=8.5, leading=11, textColor=muted,
+    ))
+    styles.add(ParagraphStyle(
+        name="SmallMuted", parent=styles["BodyText"], fontName="Helvetica",
+        fontSize=8, leading=11, textColor=muted,
+    ))
+
+    def para(value, style="Cell"):
+        safe = html.escape(str(value)).replace("\n", "<br/>")
+        return Paragraph(safe, styles[style])
+
+    username = f"@{telegram_user.username}" if getattr(telegram_user, "username", None) else f"Telegram ID {getattr(telegram_user, 'id', 'N/A')}"
+    tier = "PRO MEMBER" if is_pro else "STANDARD MEMBER"
+    generated = datetime.now(timezone.utc).strftime("%d %b %Y, %H:%M UTC")
+
+    hero = Table([
+        [Paragraph("DOMAIN INTELLIGENCE", ParagraphStyle(
+            "Eyebrow", parent=styles["Normal"], fontName="Helvetica-Bold",
+            fontSize=8, textColor=colors.HexColor("#69E0D5"), leading=11,
+        ))],
+        [Paragraph(html.escape(domain), styles["ReportTitle"])],
+        [Paragraph(f"WHOIS &amp; DNS REPORT  •  {html.escape(tier)}", styles["ReportSub"])],
+    ], colWidths=[174 * mm])
+    hero.setStyle(TableStyle([
+        ("BACKGROUND", (0, 0), (-1, -1), navy),
+        ("BOX", (0, 0), (-1, -1), 0, navy),
+        ("LEFTPADDING", (0, 0), (-1, -1), 12),
+        ("RIGHTPADDING", (0, 0), (-1, -1), 12),
+        ("TOPPADDING", (0, 0), (-1, 0), 13),
+        ("BOTTOMPADDING", (0, -1), (-1, -1), 13),
+    ]))
+
+    story = [hero, Spacer(1, 9 * mm)]
+    meta = Table([
+        [para("REQUESTED BY", "CellLabel"), para(username), para("GENERATED", "CellLabel"), para(generated)],
+    ], colWidths=[27 * mm, 48 * mm, 24 * mm, 75 * mm])
+    meta.setStyle(TableStyle([
+        ("BACKGROUND", (0, 0), (-1, -1), pale),
+        ("BOX", (0, 0), (-1, -1), 0.5, border),
+        ("VALIGN", (0, 0), (-1, -1), "TOP"),
+        ("LEFTPADDING", (0, 0), (-1, -1), 7),
+        ("RIGHTPADDING", (0, 0), (-1, -1), 7),
+        ("TOPPADDING", (0, 0), (-1, -1), 8),
+        ("BOTTOMPADDING", (0, 0), (-1, -1), 8),
+    ]))
+    story.extend([meta, Paragraph("REGISTRATION DETAILS", styles["SectionHead"])])
+
+    details = [
+        ("Domain", domain),
+        ("Registrar", _pdf_value(whois_data.get("registrar"))),
+        ("Created", _pdf_value(whois_data.get("creation_date"))),
+        ("Expiration", _pdf_value(whois_data.get("expiration_date"))),
+        ("Last Updated", _pdf_value(whois_data.get("updated_date"))),
+        ("Name Servers", _pdf_value(whois_data.get("name_servers"))),
+        ("Domain Status", _pdf_value(whois_data.get("status"))),
+        ("Registrant Emails", _pdf_value(whois_data.get("emails"))),
+        ("Organization", _pdf_value(whois_data.get("org"))),
+        ("Country", _pdf_value(whois_data.get("country"))),
+        ("Data Source", _pdf_value(whois_data.get("source"))),
+    ]
+    rows = [[para("FIELD", "CellLabel"), para("VALUE", "CellLabel")]]
+    rows += [[para(label, "CellLabel"), para(value)] for label, value in details]
+    table = Table(rows, colWidths=[43 * mm, 131 * mm], repeatRows=1, hAlign="LEFT")
+    table.setStyle(TableStyle([
+        ("BACKGROUND", (0, 0), (-1, 0), pale),
+        ("TEXTCOLOR", (0, 0), (-1, 0), navy),
+        ("LINEBELOW", (0, 0), (-1, 0), 1, teal),
+        ("GRID", (0, 1), (-1, -1), 0.35, border),
+        ("VALIGN", (0, 0), (-1, -1), "TOP"),
+        ("LEFTPADDING", (0, 0), (-1, -1), 8),
+        ("RIGHTPADDING", (0, 0), (-1, -1), 8),
+        ("TOPPADDING", (0, 0), (-1, -1), 7),
+        ("BOTTOMPADDING", (0, 0), (-1, -1), 7),
+        ("ROWBACKGROUNDS", (0, 1), (-1, -1), [colors.white, colors.HexColor("#FAFCFE")]),
+    ]))
+    story.extend([table, Paragraph("DNS RECORDS", styles["SectionHead"])])
+
+    dns_rows = [[para("TYPE", "CellLabel"), para("RECORD VALUES", "CellLabel")]]
+    for kind in ("NS", "A", "MX", "TXT"):
+        values = (dns_data or {}).get(kind) or []
+        dns_rows.append([para(kind, "CellLabel"), para(_pdf_value(values))])
+    dns_table = Table(dns_rows, colWidths=[25 * mm, 149 * mm], repeatRows=1, hAlign="LEFT")
+    dns_table.setStyle(TableStyle([
+        ("BACKGROUND", (0, 0), (-1, 0), pale),
+        ("LINEBELOW", (0, 0), (-1, 0), 1, teal),
+        ("GRID", (0, 1), (-1, -1), 0.35, border),
+        ("VALIGN", (0, 0), (-1, -1), "TOP"),
+        ("LEFTPADDING", (0, 0), (-1, -1), 8),
+        ("RIGHTPADDING", (0, 0), (-1, -1), 8),
+        ("TOPPADDING", (0, 0), (-1, -1), 7),
+        ("BOTTOMPADDING", (0, 0), (-1, -1), 7),
+        ("ROWBACKGROUNDS", (0, 1), (-1, -1), [colors.white, colors.HexColor("#FAFCFE")]),
+    ]))
+    story.extend([
+        dns_table,
+        Spacer(1, 8 * mm),
+        Paragraph("This report contains publicly available WHOIS/RDAP and DNS information at the time of generation. Some registration fields may be hidden by privacy services or unavailable from the registry.", styles["SmallMuted"]),
+    ])
+
+    def decorate(canvas, document):
+        canvas.saveState()
+        page_width, page_height = A4
+        canvas.setFillColor(teal)
+        canvas.rect(0, page_height - 4 * mm, page_width, 4 * mm, fill=1, stroke=0)
+        canvas.setStrokeColor(border)
+        canvas.line(18 * mm, 14 * mm, page_width - 18 * mm, 14 * mm)
+        canvas.setFont("Helvetica-Bold", 8)
+        canvas.setFillColor(navy)
+        canvas.drawString(18 * mm, 9 * mm, "Powered by Jazib Ali Abbas")
+        canvas.setFont("Helvetica", 8)
+        canvas.setFillColor(muted)
+        canvas.drawRightString(page_width - 18 * mm, 9 * mm, f"Page {document.page}")
+        canvas.restoreState()
+
+    doc.build(story, onFirstPage=decorate, onLaterPages=decorate)
+    buffer.seek(0)
+    return buffer
 
 def user_keyboard(domain):
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("🔁 Re-check", callback_data=f"recheck:{domain}"),
-         InlineKeyboardButton("📄 Export as TXT file", callback_data=f"export:{domain}")],
+         InlineKeyboardButton("📑 Export branded PDF", callback_data=f"export:{domain}")],
         [InlineKeyboardButton("🔍 Check Another", callback_data="another")],
     ])
 
@@ -96,7 +270,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await ensure_user(update)
     await update.effective_message.reply_text(
         "Welcome to WHOIS Bot 🌐\nYou have 3 free tokens per 24h. 1 domain = 1 token. "
-        "Failed lookups are free. /help to see commands."
+        "Failed lookups are free. /help to see commands.\n\nPowered by Jazib Ali Abbas"
     )
 
 async def help_command(update, context):
@@ -106,7 +280,7 @@ async def help_command(update, context):
         "/start — Start the bot\n/balance or /tokens — Token balance\n/history — Recent successful lookups\n"
         "/buypro — Pro information\n/help — This message\n\n"
         "Each successful WHOIS lookup costs 1 token. Failed lookups are free. "
-        "Free tokens reset every 24 hours on a rolling basis.",
+        "Free tokens reset every 24 hours on a rolling basis.\n\n<i>Powered by Jazib Ali Abbas</i>",
         parse_mode=ParseMode.HTML
     )
 
@@ -118,7 +292,7 @@ async def balance_command(update, context):
         text = f"Tokens: Unlimited\nResets in: {remaining_text(_reset_seconds(user))}\nPro: Yes"
     else:
         text = f"Tokens: {user.get('tokens', 0)}/{FREE_TOKENS}, Resets in: {remaining_text(_reset_seconds(user))}, Pro: No"
-    await update.effective_message.reply_text(text)
+    await update.effective_message.reply_text(f"{text}\n\nPowered by Jazib Ali Abbas")
 
 def _reset_seconds(user):
     from database import parse_dt, now_utc
@@ -135,13 +309,14 @@ async def history_command(update, context):
     lines = ["📜 <b>Your recent successful lookups</b>"]
     for item in history:
         lines.append(f"• <code>{html.escape(item['domain'])}</code> — {html.escape(item['timestamp'][:16].replace('T', ' '))}")
+    lines.append("\n<i>Powered by Jazib Ali Abbas</i>")
     await update.effective_message.reply_text("\n".join(lines), parse_mode=ParseMode.HTML)
 
 async def buypro_command(update, context):
     await ensure_user(update)
     await update.effective_message.reply_text(
         "💎 <b>WHOIS Bot Pro</b>\nPro gives unlimited lookups while your subscription is active.\n"
-        "Contact the bot administrator to arrange access.",
+        "Contact the bot administrator to arrange access.\n\n<i>Powered by Jazib Ali Abbas</i>",
         parse_mode=ParseMode.HTML
     )
 
@@ -187,7 +362,8 @@ async def perform_lookup(update, context, domain, callback_query=None):
             await status_msg.edit_text("❌ Your tokens changed while this lookup was running. No token was charged.")
             return
         user = await db.use_token(user_id, success=True, domain=domain)
-        result_text = format_result(domain, whois_data, dns_data)
+        user_label = f"@{update.effective_user.username}" if update.effective_user.username else f"ID {user_id}"
+        result_text = format_result(domain, whois_data, dns_data, user_label, bool(user and user.get("is_pro")))
         if user and not user.get("is_pro"):
             result_text += f"\n\n🎟️ Tokens remaining: {user['tokens']}/{FREE_TOKENS}"
         await status_msg.edit_text(result_text, parse_mode=ParseMode.HTML, reply_markup=user_keyboard(domain))
@@ -244,11 +420,18 @@ async def result_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not whois_data:
             await query.message.reply_text("❌ Could not retrieve current data to export. No token charged.")
             return
-        content = format_result(domain, whois_data, dns_data if isinstance(dns_data, dict) else {})
-        plain = re.sub(r"</?b>|</?code>", "", content)
-        file = io.BytesIO(plain.encode("utf-8"))
-        file.name = f"{domain.replace('.', '_')}_whois.txt"
-        await query.message.reply_document(document=InputFile(file), caption=f"📄 WHOIS report for {domain}")
+        if not isinstance(dns_data, dict):
+            dns_data = {k: [] for k in ("NS", "A", "MX", "TXT")}
+        access = await db.can_search_and_get_tokens(update.effective_user.id)
+        is_pro = bool(access.get("pro"))
+        pdf = build_pdf_report(domain, whois_data, dns_data, update.effective_user, is_pro)
+        pdf.name = f"{domain.replace('.', '_')}_whois_report.pdf"
+        tier = "💎 PRO member" if is_pro else "Standard member"
+        username = f"@{update.effective_user.username}" if update.effective_user.username else f"ID {update.effective_user.id}"
+        await query.message.reply_document(
+            document=InputFile(pdf, filename=pdf.name),
+            caption=f"📑 Branded WHOIS report\n🌐 {domain}\n👤 {username} • {tier}\nPowered by Jazib Ali Abbas",
+        )
 
 async def error_handler(update, context):
     log.error("Unhandled Telegram update error: %s", context.error, exc_info=context.error)

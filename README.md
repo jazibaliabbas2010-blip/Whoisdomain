@@ -63,3 +63,7 @@ The bot charges only after it receives usable registration data from WHOIS or RD
 ## Operational notes
 
 WHOIS servers and RDAP registries can rate-limit or omit fields. Domain registration privacy can hide contact information. DNS records can legitimately be absent. Results are best-effort and are not a substitute for registrar records. Use a process manager (systemd, Docker, or a hosting platform's worker service) to keep the bot running.
+
+## Branding and PDF reports
+
+Bot responses and exported reports are branded “Powered by Jazib Ali Abbas”. The export button generates a modern PDF report with registration fields, DNS records, generation time, requesting Telegram username/ID, and the user tier (Standard or PRO). Install dependencies from `requirements.txt` to include ReportLab.
