@@ -1,12 +1,14 @@
 import asyncio
 import logging
+import os
+import tempfile
 from datetime import datetime, timezone
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.constants import ParseMode
 from telegram.error import TelegramError, RetryAfter, TimedOut, NetworkError
 from telegram.ext import ContextTypes, CommandHandler, CallbackQueryHandler
 import database as db
-from config import ADMIN_IDS
+from config import ADMIN_IDS, BACKUP_DIR
 
 log = logging.getLogger(__name__)
 
@@ -27,6 +29,7 @@ async def admin_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
          InlineKeyboardButton("👥 Users", callback_data="adm:users")],
         [InlineKeyboardButton("📢 Broadcast", callback_data="adm:broadcast"),
          InlineKeyboardButton("💎 Pro Management", callback_data="adm:pro")],
+        [InlineKeyboardButton("🗄️ Database Backup", callback_data="adm:backup")],
     ]
     await update.effective_message.reply_text("🛠 <b>Admin Dashboard</b>\nChoose an action below.",
         parse_mode=ParseMode.HTML, reply_markup=InlineKeyboardMarkup(keyboard))
@@ -42,12 +45,14 @@ async def admin_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         s = await db.get_stats()
         text = (f"📊 <b>Statistics</b>\nUsers: {s['users']}\nActive/new today: {s['active_today']}"
                 f"\nSuccessful lookups: {s['successful']}\nFailed lookups: {s['failed']}"
-                f"\nFree users: {s['free']}\nPro users: {s['pro']}\nTokens used today: {s['tokens_used_today']}")
+                f"\nFree users: {s['free']}\nPro users: {s['pro']}\nTokens used today: {s['tokens_used_today']}\nWatched domains: {s.get('watched_domains', 0)}")
     elif action == "users":
         s = await db.get_stats()
         text = f"👥 Total users: {s['users']}\nUse /checkuser USER_ID to inspect a user."
     elif action == "broadcast":
         text = "📢 Send <code>/broadcast your message here</code> to broadcast to all unbanned users."
+    elif action == "backup":
+        text = "🗄️ Use /backup to create and download a consistent SQLite database backup. Keep the file private."
     else:
         text = "💎 Pro management:\n/addpro USER_ID DAYS\n/removepro USER_ID"
     await query.edit_message_text(text, parse_mode=ParseMode.HTML)
@@ -58,7 +63,7 @@ async def stats_command(update, context):
     await update.effective_message.reply_text(
         f"📊 Stats\nTotal users: {s['users']}\nActive/new today: {s['active_today']}\n"
         f"Successful lookups: {s['successful']}\nFailed lookups: {s['failed']}\n"
-        f"Free users: {s['free']}\nPro users: {s['pro']}\nTokens used today: {s['tokens_used_today']}")
+        f"Free users: {s['free']}\nPro users: {s['pro']}\nTokens used today: {s['tokens_used_today']}\nWatched domains: {s.get('watched_domains', 0)}")
 
 async def addpro_command(update, context):
     if not await admin_only(update, context): return
@@ -136,6 +141,29 @@ async def unban_command(update, context):
     except (IndexError, ValueError):
         await update.effective_message.reply_text("Usage: /unban USER_ID")
 
+async def backup_command(update, context):
+    if not await admin_only(update, context):
+        return
+    os.makedirs(BACKUP_DIR, exist_ok=True)
+    fd, path = tempfile.mkstemp(prefix="whois_bot_manual_backup_", suffix=".db", dir=BACKUP_DIR)
+    os.close(fd)
+    try:
+        await db.create_backup(path)
+        with open(path, "rb") as file_obj:
+            await update.effective_message.reply_document(
+                document=file_obj,
+                filename=f"whois_bot_backup_{datetime.now(timezone.utc).strftime('%Y%m%d_%H%M%S_UTC')}.db",
+                caption="🗄️ Consistent SQLite database backup. Store it privately.\nPowered by Jazib Ali Abbas")
+        log.warning("ADMIN %s downloaded a database backup", update.effective_user.id)
+    except Exception:
+        log.exception("Manual database backup failed")
+        await update.effective_message.reply_text("❌ Backup failed. Check the hosting logs and confirm the database path is writable.")
+    finally:
+        try:
+            os.remove(path)
+        except OSError:
+            pass
+
 async def broadcast_command(update, context):
     if not await admin_only(update, context): return
     message = " ".join(context.args).strip()
@@ -173,3 +201,4 @@ def register_admin_handlers(app):
     app.add_handler(CommandHandler("ban", ban_command))
     app.add_handler(CommandHandler("unban", unban_command))
     app.add_handler(CommandHandler("broadcast", broadcast_command))
+    app.add_handler(CommandHandler("backup", backup_command))

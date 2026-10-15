@@ -1,4 +1,5 @@
 import aiosqlite
+import json
 from datetime import datetime, timedelta, timezone
 from config import DATABASE_PATH, FREE_TOKENS, RESET_HOURS
 
@@ -40,6 +41,20 @@ async def init_db():
         )""")
         await db.execute("CREATE INDEX IF NOT EXISTS idx_usage_user_time ON usage_log(user_id, timestamp)")
         await db.execute("CREATE INDEX IF NOT EXISTS idx_failed_user ON failed_log(user_id)")
+        # Additive feature table: leaves the existing users/usage_log/failed_log schema intact.
+        await db.execute("""
+        CREATE TABLE IF NOT EXISTS domain_watches (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER NOT NULL,
+            domain TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            last_checked TEXT,
+            last_snapshot TEXT,
+            expiry_stage INTEGER DEFAULT 0,
+            UNIQUE(user_id, domain)
+        )""")
+        await db.execute("CREATE INDEX IF NOT EXISTS idx_watches_user ON domain_watches(user_id)")
+        await db.execute("CREATE INDEX IF NOT EXISTS idx_watches_checked ON domain_watches(last_checked)")
         await db.commit()
 
 async def create_user(user_id, username=None, first_name=None):
@@ -194,8 +209,11 @@ async def get_stats():
         active_today = (await cur.fetchone())[0]
         cur = await db.execute("SELECT COUNT(*) FROM usage_log WHERE timestamp>=? AND success=1", (today,))
         tokens_used = (await cur.fetchone())[0]
+        cur = await db.execute("SELECT COUNT(*) FROM domain_watches")
+        watched_domains = (await cur.fetchone())[0]
     return {"users": users, "pro": pro, "free": users-pro, "successful": successful,
-            "failed": failed, "active_today": active_today, "tokens_used_today": tokens_used}
+            "failed": failed, "active_today": active_today, "tokens_used_today": tokens_used,
+            "watched_domains": watched_domains}
 
 async def get_all_user_ids():
     async with aiosqlite.connect(DATABASE_PATH) as db:
@@ -211,3 +229,62 @@ async def get_user_admin_info(user_id):
         cur = await db.execute("SELECT COUNT(*) FROM failed_log WHERE user_id=?", (user_id,))
         user["failed_count"] = (await cur.fetchone())[0]
     return user
+
+
+async def add_watch(user_id, domain, limit):
+    async with aiosqlite.connect(DATABASE_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        cur = await db.execute("SELECT COUNT(*) FROM domain_watches WHERE user_id=?", (user_id,))
+        count = (await cur.fetchone())[0]
+        cur = await db.execute("SELECT id FROM domain_watches WHERE user_id=? AND domain=?", (user_id, domain))
+        existing = await cur.fetchone()
+        if existing:
+            return {"ok": True, "exists": True, "count": count}
+        if count >= limit:
+            return {"ok": False, "exists": False, "count": count}
+        await db.execute("INSERT INTO domain_watches(user_id,domain,created_at) VALUES(?,?,?)", (user_id, domain, iso()))
+        await db.commit()
+        return {"ok": True, "exists": False, "count": count + 1}
+
+async def remove_watch(user_id, domain):
+    async with aiosqlite.connect(DATABASE_PATH) as db:
+        cur = await db.execute("DELETE FROM domain_watches WHERE user_id=? AND domain=?", (user_id, domain))
+        await db.commit()
+        return cur.rowcount > 0
+
+async def get_watches(user_id):
+    async with aiosqlite.connect(DATABASE_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        cur = await db.execute("SELECT * FROM domain_watches WHERE user_id=? ORDER BY created_at DESC", (user_id,))
+        return [dict(row) for row in await cur.fetchall()]
+
+async def get_all_watches(limit=200):
+    async with aiosqlite.connect(DATABASE_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        cur = await db.execute("SELECT w.* FROM domain_watches w LEFT JOIN users u ON u.user_id=w.user_id WHERE COALESCE(u.is_banned,0)=0 ORDER BY COALESCE(w.last_checked,'') ASC LIMIT ?", (limit,))
+        return [dict(row) for row in await cur.fetchall()]
+
+async def update_watch_snapshot(watch_id, snapshot, expiry_stage):
+    async with aiosqlite.connect(DATABASE_PATH) as db:
+        await db.execute("UPDATE domain_watches SET last_snapshot=?, last_checked=?, expiry_stage=? WHERE id=?",
+                         (json.dumps(snapshot, sort_keys=True), iso(), int(expiry_stage), watch_id))
+        await db.commit()
+
+async def get_personal_stats(user_id):
+    async with aiosqlite.connect(DATABASE_PATH) as db:
+        cur = await db.execute("SELECT COUNT(*) FROM usage_log WHERE user_id=? AND success=1", (user_id,))
+        successful = (await cur.fetchone())[0]
+        cur = await db.execute("SELECT COUNT(*) FROM failed_log WHERE user_id=?", (user_id,))
+        failed = (await cur.fetchone())[0]
+        since = iso(now_utc() - timedelta(days=7))
+        cur = await db.execute("SELECT COUNT(*) FROM usage_log WHERE user_id=? AND success=1 AND timestamp>=?", (user_id, since))
+        last7 = (await cur.fetchone())[0]
+        cur = await db.execute("SELECT COUNT(*) FROM domain_watches WHERE user_id=?", (user_id,))
+        watched = (await cur.fetchone())[0]
+    return {"successful": successful, "failed": failed, "last7": last7, "watched": watched}
+
+async def create_backup(destination):
+    """Create a consistent SQLite backup, including WAL changes, at destination."""
+    async with aiosqlite.connect(DATABASE_PATH) as source:
+        async with aiosqlite.connect(destination) as target:
+            await source.backup(target)

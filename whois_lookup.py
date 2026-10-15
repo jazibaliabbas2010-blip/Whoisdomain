@@ -8,7 +8,7 @@ import whois
 from config import LOOKUP_TIMEOUT_SECONDS
 
 log = logging.getLogger(__name__)
-DNS_TYPES = ("NS", "A", "MX", "TXT")
+DNS_TYPES = ("NS", "A", "AAAA", "CNAME", "MX", "TXT")
 RDAP_HEADERS = {
     "Accept": "application/rdap+json, application/json",
     "User-Agent": "DomainLookupBot/1.0",

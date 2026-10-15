@@ -2,9 +2,11 @@ import asyncio
 import html
 import io
 import logging
+import json
+import os
 import re
 import time
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 from urllib.parse import urlparse
 
 from reportlab.lib import colors
@@ -20,7 +22,8 @@ from telegram.error import TelegramError
 from telegram.ext import Application, CommandHandler, MessageHandler, CallbackQueryHandler, ContextTypes, filters
 
 import database as db
-from config import BOT_TOKEN, ADMIN_IDS, FREE_TOKENS, RESET_HOURS, MAX_HISTORY, ANTI_SPAM_SECONDS
+from config import (BOT_TOKEN, ADMIN_IDS, FREE_TOKENS, RESET_HOURS, MAX_HISTORY, ANTI_SPAM_SECONDS,
+                     WATCH_LIMIT_FREE, WATCH_LIMIT_PRO, MONITOR_INTERVAL_HOURS, BACKUP_DIR, BACKUP_RETENTION_DAYS)
 from whois_lookup import get_whois_data, get_dns_data
 from admin_handlers import register_admin_handlers
 
@@ -80,7 +83,7 @@ def format_result(domain, whois_data, dns_data, requested_by=None, is_pro=False)
     for label, value in fields:
         lines.append(f"{label}: {html.escape(fmt(value))}")
     lines.append("\n📡 <b>DNS Records</b>")
-    for kind in ("NS", "A", "MX", "TXT"):
+    for kind in ("NS", "A", "AAAA", "CNAME", "MX", "TXT"):
         vals = dns_data.get(kind) or []
         display = ", ".join(str(x) for x in vals[:8]) if vals else "N/A"
         if len(display) > 700:
@@ -215,7 +218,7 @@ def build_pdf_report(domain, whois_data, dns_data, telegram_user, is_pro=False):
     story.extend([table, Paragraph("DNS RECORDS", styles["SectionHead"])])
 
     dns_rows = [[para("TYPE", "CellLabel"), para("RECORD VALUES", "CellLabel")]]
-    for kind in ("NS", "A", "MX", "TXT"):
+    for kind in ("NS", "A", "AAAA", "CNAME", "MX", "TXT"):
         values = (dns_data or {}).get(kind) or []
         dns_rows.append([para(kind, "CellLabel"), para(_pdf_value(values))])
     dns_table = Table(dns_rows, colWidths=[25 * mm, 149 * mm], repeatRows=1, hAlign="LEFT")
@@ -278,7 +281,8 @@ async def help_command(update, context):
     await update.effective_message.reply_text(
         "🌐 <b>WHOIS Bot Help</b>\nSend a domain such as <code>google.com</code> to look it up.\n\n"
         "/start — Start the bot\n/balance or /tokens — Token balance\n/history — Recent successful lookups\n"
-        "/buypro — Pro information\n/help — This message\n\n"
+        "/buypro — Pro information\n/profile — Account profile\n/mystats — Your usage statistics\n"
+        "/watch domain.com — Monitor a domain\n/unwatch domain.com — Stop monitoring\n/watchlist — List monitored domains\n/help — This message\n\n"
         "Each successful WHOIS lookup costs 1 token. Failed lookups are free. "
         "Free tokens reset every 24 hours on a rolling basis.\n\n<i>Powered by Jazib Ali Abbas</i>",
         parse_mode=ParseMode.HTML
@@ -293,6 +297,170 @@ async def balance_command(update, context):
     else:
         text = f"Tokens: {user.get('tokens', 0)}/{FREE_TOKENS}, Resets in: {remaining_text(_reset_seconds(user))}, Pro: No"
     await update.effective_message.reply_text(f"{text}\n\nPowered by Jazib Ali Abbas")
+
+async def profile_command(update, context):
+    await ensure_user(update)
+    user = await db.reset_tokens_if_needed(update.effective_user.id)
+    access = await db.can_search_and_get_tokens(update.effective_user.id)
+    stats = await db.get_personal_stats(update.effective_user.id)
+    pro_until = user.get("pro_until") if access.get("pro") else None
+    username = f"@{update.effective_user.username}" if update.effective_user.username else "No public username"
+    tier = "💎 PRO" if access.get("pro") else "Standard"
+    lines = ["👤 <b>Your Profile</b>", f"Name: {html.escape(update.effective_user.full_name)}",
+             f"Username: {html.escape(username)}", f"Telegram ID: <code>{update.effective_user.id}</code>",
+             f"Plan: {tier}", f"Tokens: {'Unlimited' if access.get('pro') else str(user.get('tokens', 0)) + '/' + str(FREE_TOKENS)}",
+             f"Total successful lookups: {stats['successful']}", f"Lookups in last 7 days: {stats['last7']}",
+             f"Failed attempts: {stats['failed']}", f"Watched domains: {stats['watched']}"]
+    if pro_until:
+        lines.append(f"PRO expires: {html.escape(pro_until[:16].replace('T', ' '))} UTC")
+    lines.append("\n<i>Powered by Jazib Ali Abbas</i>")
+    await update.effective_message.reply_text("\n".join(lines), parse_mode=ParseMode.HTML)
+
+async def mystats_command(update, context):
+    await ensure_user(update)
+    stats = await db.get_personal_stats(update.effective_user.id)
+    await update.effective_message.reply_text(
+        "📈 <b>Your Usage Statistics</b>\n"
+        f"Successful lookups: {stats['successful']}\nFailed attempts: {stats['failed']}\n"
+        f"Successful lookups in last 7 days: {stats['last7']}\nWatched domains: {stats['watched']}\n\n"
+        "Use /profile for your account details.\n<i>Powered by Jazib Ali Abbas</i>", parse_mode=ParseMode.HTML)
+
+async def watch_command(update, context):
+    await ensure_user(update)
+    if not context.args:
+        await update.effective_message.reply_text("Usage: /watch example.com\nI’ll check for DNS changes and domain expiry alerts.")
+        return
+    domain = normalize_domain(context.args[0])
+    if not domain or len(context.args) > 1:
+        await update.effective_message.reply_text("❌ Send one valid domain, e.g. /watch example.com")
+        return
+    access = await db.can_search_and_get_tokens(update.effective_user.id)
+    if not access.get("allowed") and access.get("reason") != "no_tokens":
+        await update.effective_message.reply_text(f"❌ {access.get('reason', 'Not allowed.')}")
+        return
+    is_pro = bool(access.get("pro"))
+    limit = WATCH_LIMIT_PRO if is_pro else WATCH_LIMIT_FREE
+    result = await db.add_watch(update.effective_user.id, domain, limit)
+    if result["exists"]:
+        await update.effective_message.reply_text(f"👀 <code>{html.escape(domain)}</code> is already on your watchlist.", parse_mode=ParseMode.HTML)
+    elif not result["ok"]:
+        await update.effective_message.reply_text(f"Your plan supports {limit} watched domains. Remove one with /unwatch domain.com or upgrade via /buypro.")
+    else:
+        await update.effective_message.reply_text(
+            f"🔔 Added <code>{html.escape(domain)}</code> to your watchlist ({result['count']}/{limit}).\n"
+            "I’ll check daily for DNS changes and expiry milestones (30, 7 and 1 day when expiry data is available).\n\n"
+            "Monitoring is best-effort and depends on registry/DNS availability.\n<i>Powered by Jazib Ali Abbas</i>", parse_mode=ParseMode.HTML)
+
+async def unwatch_command(update, context):
+    await ensure_user(update)
+    if not context.args:
+        await update.effective_message.reply_text("Usage: /unwatch example.com")
+        return
+    domain = normalize_domain(context.args[0])
+    if not domain:
+        await update.effective_message.reply_text("❌ Invalid domain.")
+        return
+    removed = await db.remove_watch(update.effective_user.id, domain)
+    await update.effective_message.reply_text("✅ Removed from watchlist." if removed else "That domain isn’t on your watchlist.")
+
+async def watchlist_command(update, context):
+    await ensure_user(update)
+    watches = await db.get_watches(update.effective_user.id)
+    if not watches:
+        await update.effective_message.reply_text("Your watchlist is empty. Add a domain with /watch example.com")
+        return
+    lines = ["👀 <b>Your Domain Watchlist</b>"]
+    for item in watches:
+        checked = (item.get("last_checked") or "Not checked yet")[:16].replace("T", " ")
+        lines.append(f"• <code>{html.escape(item['domain'])}</code> — checked: {html.escape(checked)} UTC")
+    lines.append("\nRemove a domain with /unwatch example.com\n<i>Powered by Jazib Ali Abbas</i>")
+    await update.effective_message.reply_text("\n".join(lines), parse_mode=ParseMode.HTML)
+
+def _expiration_date(value):
+    if isinstance(value, (list, tuple)):
+        value = next((item for item in value if item), None)
+    if not value:
+        return None
+    if isinstance(value, datetime):
+        return value.date()
+    if isinstance(value, date):
+        return value
+    text = str(value).strip()
+    try:
+        return datetime.fromisoformat(text.replace("Z", "+00:00")).date()
+    except ValueError:
+        for fmt in ("%Y-%m-%d", "%Y-%m-%d %H:%M:%S", "%d-%b-%Y", "%d/%m/%Y"):
+            try:
+                return datetime.strptime(text[:19], fmt).date()
+            except ValueError:
+                continue
+    return None
+
+async def monitor_watches_job(context):
+    watches = await db.get_all_watches(limit=200)
+    for watch in watches:
+        try:
+            whois_data, dns_data = await asyncio.gather(
+                get_whois_data(watch["domain"]), get_dns_data(watch["domain"]), return_exceptions=True)
+            if isinstance(whois_data, Exception) or not whois_data:
+                log.info("Monitor skipped %s: no WHOIS data", watch["domain"])
+                continue
+            if isinstance(dns_data, Exception) or not isinstance(dns_data, dict):
+                dns_data = {}
+            snapshot = {kind: sorted(str(x) for x in (dns_data.get(kind) or [])) for kind in ("NS", "A", "AAAA", "CNAME", "MX", "TXT")}
+            previous = None
+            if watch.get("last_snapshot"):
+                try:
+                    previous = json.loads(watch["last_snapshot"])
+                except (ValueError, TypeError):
+                    previous = None
+            try:
+                await context.bot.send_chat_action(chat_id=watch["user_id"], action="typing")
+            except TelegramError:
+                pass
+            if previous is not None and previous != snapshot:
+                changed = [key for key in snapshot if previous.get(key, []) != snapshot.get(key, [])]
+                if changed:
+                    await context.bot.send_message(
+                        chat_id=watch["user_id"],
+                        text=f"🔔 <b>DNS change detected</b>\nDomain: <code>{html.escape(watch['domain'])}</code>\nChanged record types: {', '.join(changed)}\n\n<i>Powered by Jazib Ali Abbas</i>",
+                        parse_mode=ParseMode.HTML)
+            expiry = _expiration_date(whois_data.get("expiration_date"))
+            stage = int(watch.get("expiry_stage") or 0)
+            if expiry:
+                days_left = (expiry - datetime.now(timezone.utc).date()).days
+                new_stage = 3 if days_left <= 1 else 2 if days_left <= 7 else 1 if days_left <= 30 else 0
+                if new_stage > stage and new_stage > 0:
+                    label = "1 day or less" if new_stage == 3 else "7 days or less" if new_stage == 2 else "30 days or less"
+                    await context.bot.send_message(
+                        chat_id=watch["user_id"],
+                        text=f"⏳ <b>Domain expiry alert</b>\n<code>{html.escape(watch['domain'])}</code> may expire in <b>{label}</b>.\nReported expiration date: {expiry.isoformat()}\nPlease verify with your registrar.\n\n<i>Powered by Jazib Ali Abbas</i>",
+                        parse_mode=ParseMode.HTML)
+                    stage = new_stage
+                elif days_left > 30:
+                    stage = 0
+            await db.update_watch_snapshot(watch["id"], snapshot, stage)
+            await asyncio.sleep(0.25)
+        except TelegramError as exc:
+            log.info("Could not notify watcher %s for %s: %s", watch.get("user_id"), watch.get("domain"), exc)
+        except Exception:
+            log.exception("Watch monitor error for %s", watch.get("domain"))
+
+async def automatic_backup_job(context):
+    try:
+        os.makedirs(BACKUP_DIR, exist_ok=True)
+        stamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S_UTC")
+        path = os.path.join(BACKUP_DIR, f"whois_bot_{stamp}.db")
+        await db.create_backup(path)
+        cutoff = datetime.now(timezone.utc).timestamp() - max(1, BACKUP_RETENTION_DAYS) * 86400
+        for name in os.listdir(BACKUP_DIR):
+            candidate = os.path.join(BACKUP_DIR, name)
+            if name.endswith(".db") and os.path.isfile(candidate) and os.path.getmtime(candidate) < cutoff:
+                try: os.remove(candidate)
+                except OSError: log.warning("Could not prune backup %s", candidate)
+        log.info("Automatic database backup created: %s", path)
+    except Exception:
+        log.exception("Automatic database backup failed")
 
 def _reset_seconds(user):
     from database import parse_dt, now_utc
@@ -355,7 +523,7 @@ async def perform_lookup(update, context, domain, callback_query=None):
             )
             return
         if isinstance(dns_data, Exception) or not isinstance(dns_data, dict):
-            dns_data = {k: [] for k in ("NS", "A", "MX", "TXT")}
+            dns_data = {k: [] for k in ("NS", "A", "AAAA", "CNAME", "MX", "TXT")}
         # Re-check and charge atomically only after valid WHOIS/RDAP data exists.
         latest = await db.can_search_and_get_tokens(user_id)
         if not latest.get("allowed"):
@@ -421,7 +589,7 @@ async def result_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await query.message.reply_text("❌ Could not retrieve current data to export. No token charged.")
             return
         if not isinstance(dns_data, dict):
-            dns_data = {k: [] for k in ("NS", "A", "MX", "TXT")}
+            dns_data = {k: [] for k in ("NS", "A", "AAAA", "CNAME", "MX", "TXT")}
         access = await db.can_search_and_get_tokens(update.effective_user.id)
         is_pro = bool(access.get("pro"))
         pdf = build_pdf_report(domain, whois_data, dns_data, update.effective_user, is_pro)
@@ -446,6 +614,12 @@ def main():
     async def post_init(application):
         await db.init_db()
         log.info("Database initialized")
+        if application.job_queue:
+            interval = max(1, MONITOR_INTERVAL_HOURS) * 3600
+            application.job_queue.run_repeating(monitor_watches_job, interval=interval, first=30, name="domain_watch_monitor")
+            application.job_queue.run_repeating(automatic_backup_job, interval=24 * 3600, first=60, name="database_backup")
+        else:
+            log.warning("Job queue unavailable; domain monitoring and automatic backups are disabled")
 
     app.post_init = post_init
     app.add_handler(CommandHandler("start", start))
@@ -453,6 +627,11 @@ def main():
     app.add_handler(CommandHandler("balance", balance_command))
     app.add_handler(CommandHandler("tokens", balance_command))
     app.add_handler(CommandHandler("history", history_command))
+    app.add_handler(CommandHandler("profile", profile_command))
+    app.add_handler(CommandHandler("mystats", mystats_command))
+    app.add_handler(CommandHandler("watch", watch_command))
+    app.add_handler(CommandHandler("unwatch", unwatch_command))
+    app.add_handler(CommandHandler("watchlist", watchlist_command))
     app.add_handler(CommandHandler("buypro", buypro_command))
     app.add_handler(CallbackQueryHandler(result_callback, pattern=r"^(recheck:|export:|another$)"))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, domain_message))

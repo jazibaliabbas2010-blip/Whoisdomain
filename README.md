@@ -1,69 +1,83 @@
-# Domain WHOIS + NS Lookup Telegram Bot
+# Domain WHOIS + DNS Lookup Bot — Jazib Ali Abbas Edition
 
-Async Telegram bot using Python 3.11+, `python-telegram-bot`, SQLite/aiosqlite, python-whois, dnspython, RDAP, and Google DNS-over-HTTPS.
+A Python 3.11+ Telegram bot with WHOIS/RDAP fallback, DNS records, token accounting, PRO membership, PDF exports, domain monitoring, admin tools, and SQLite backups. Branding: **Powered by Jazib Ali Abbas**.
 
-## Setup
+## What's new in this upgrade
 
-1. Install Python 3.11 or newer.
-2. Create a bot with Telegram's `@BotFather` and copy its token.
-3. Copy `.env.example` to `.env`.
-4. Put your token in `BOT_TOKEN` and your Telegram numeric user ID(s) in `ADMIN_IDS`, separated by commas.
-5. Install dependencies and run:
+- `/profile` and `/mystats` — account plan, tokens, lookup totals, seven-day usage, failed attempts, and watchlist count.
+- `/watch domain.com`, `/unwatch domain.com`, `/watchlist` — daily best-effort DNS change and domain-expiry milestone alerts.
+- DNS records expanded to NS, A, AAAA, CNAME, MX, and TXT.
+- Admin `/backup` — creates and sends a consistent SQLite backup privately to the admin.
+- Automatic daily database backups in `BACKUP_DIR`, with retention cleanup.
+- Admin dashboard statistics include watched domains.
+- Branded PDF export includes registration data, DNS records, requester, membership tier, and generation time.
+- Database changes are additive: the existing `users`, `usage_log`, and `failed_log` tables are preserved. A new `domain_watches` table is created on startup.
 
-```bash
-python -m venv .venv
-# Windows: .venv\Scripts\activate
-# Linux/macOS:
-source .venv/bin/activate
-pip install -r requirements.txt
-python main.py
+## FadeHost deployment / update
+
+1. **Stop the current bot process first** so two processes do not poll Telegram or write to the same SQLite file.
+2. Back up your current `bot.db` (download it from the host if possible). Keep a copy somewhere private.
+3. Upload/replace the project files with the files in this ZIP. Keep your existing `.env` or hosting environment variables; do not overwrite your token or admin IDs.
+4. Confirm these variables are still configured in FadeHost:
+   - `BOT_TOKEN` — your existing BotFather token
+   - `ADMIN_IDS` — your numeric Telegram user ID(s), comma-separated
+   - `DATABASE_PATH` — **the exact path to your existing database**. Do not change it during an upgrade.
+5. Install dependencies from `requirements.txt` (especially `python-telegram-bot[job-queue]` and `reportlab`).
+6. Start command: `python main.py`.
+7. Open the bot and test `/start`, `/profile`, `/mystats`, a lookup such as `example.com`, and PDF export. Then test `/watch example.com` and `/watchlist`.
+8. As an admin, run `/stats` and `/backup`. Check host logs for “Database initialized” and “Starting WHOIS bot”.
+
+## Environment configuration
+
+Use the same token/admin/database settings you already have. Optional settings:
+
+```env
+FREE_TOKENS=3
+RESET_HOURS=24
+MAX_HISTORY=10
+ANTI_SPAM_SECONDS=1
+LOOKUP_TIMEOUT_SECONDS=15
+WATCH_LIMIT_FREE=5
+WATCH_LIMIT_PRO=25
+MONITOR_INTERVAL_HOURS=24
+BACKUP_DIR=backups
+BACKUP_RETENTION_DAYS=7
 ```
 
-Keep `.env`, `bot.db`, and `bot.log` private. Never publish your bot token. Run one bot process against this SQLite database at a time.
+The `.env.example` is a template only. Do not replace a working host's environment variables with the sample token.
 
 ## User commands
 
-- `/start` — welcome
-- `/help` — commands and usage
-- `/balance` or `/tokens` — balance and reset time
-- `/history` — last successful lookups
-- `/buypro` — Pro information
+- `/start`, `/help`
+- `/balance` or `/tokens`
+- `/history`
+- `/profile`, `/mystats`
+- `/watch example.com`, `/unwatch example.com`, `/watchlist`
+- `/buypro`
+- Send a domain like `example.com` for a WHOIS/RDAP and DNS lookup.
 
-Send a domain such as `example.com`. Successful WHOIS/RDAP lookups cost one token for free users; failed lookups do not cost tokens. DNS results are included when available. Free tokens reset after the configured rolling interval from `last_reset`. Pro is unlimited while active.
+Free users get 3 tokens per rolling 24 hours by default. A token is charged only after usable WHOIS/RDAP registration data is retrieved. Failed lookups remain free. Active PRO users have unlimited lookups. Default watchlist limits are 5 domains for Standard and 25 for PRO; these can be adjusted with environment variables.
 
 ## Admin commands
 
-- `/admin` — inline admin dashboard
-- `/stats` — aggregate statistics
-- `/addpro USER_ID DAYS`
-- `/removepro USER_ID`
-- `/addtokens USER_ID AMOUNT`
-- `/settokens USER_ID AMOUNT`
-- `/checkuser USER_ID`
-- `/ban USER_ID`
-- `/unban USER_ID`
+- `/admin`, `/stats`
+- `/addpro USER_ID DAYS`, `/removepro USER_ID`
+- `/addtokens USER_ID AMOUNT`, `/settokens USER_ID AMOUNT`
+- `/checkuser USER_ID`, `/ban USER_ID`, `/unban USER_ID`
 - `/broadcast MESSAGE`
+- `/backup` — sends a consistent SQLite backup to the admin who ran the command.
 
-Admin IDs are configured in `.env`. Admin commands are checked against Telegram numeric IDs, not usernames. Admin actions are logged to `bot.log`.
+Admin authorization uses Telegram numeric IDs from `ADMIN_IDS`, not usernames.
 
-## Configuration
+## Backup and monitoring notes
 
-Edit `.env`:
-- `FREE_TOKENS=3`
-- `RESET_HOURS=24`
-- `MAX_HISTORY=10`
-- `ANTI_SPAM_SECONDS=1`
-- `LOOKUP_TIMEOUT_SECONDS=15`
-- `DATABASE_PATH=bot.db`
+The bot makes an automatic local backup after startup and then every 24 hours, retaining recent `.db` backup files according to `BACKUP_RETENTION_DAYS`. `/backup` is the safer way to download a copy off-host. If FadeHost uses ephemeral storage, configure a persistent volume/path or download backups regularly; local backups on an ephemeral filesystem may disappear after redeploys.
 
-## Token accounting notes
+Monitoring runs through the JobQueue included in `python-telegram-bot[job-queue]`. If the host sleeps/stops the process, checks and alerts pause until it runs again. The monitor processes up to 200 watched domains per run to reduce load. DNS/expiry checks are best-effort: registry data may be hidden, rate-limited, or unavailable. Verify expiry dates with the registrar.
 
-The bot charges only after it receives usable registration data from WHOIS or RDAP. DNS results alone do not constitute a successful WHOIS lookup. Failed lookup attempts are recorded in `failed_log`. Successful lookups are recorded in `usage_log` and increment `total_lookups`.
+## Important
 
-## Operational notes
-
-WHOIS servers and RDAP registries can rate-limit or omit fields. Domain registration privacy can hide contact information. DNS records can legitimately be absent. Results are best-effort and are not a substitute for registrar records. Use a process manager (systemd, Docker, or a hosting platform's worker service) to keep the bot running.
-
-## Branding and PDF reports
-
-Bot responses and exported reports are branded “Powered by Jazib Ali Abbas”. The export button generates a modern PDF report with registration fields, DNS records, generation time, requesting Telegram username/ID, and the user tier (Standard or PRO). Install dependencies from `requirements.txt` to include ReportLab.
+- Keep `.env`, the database, logs, and backups private.
+- Never share `BOT_TOKEN` or publish a database backup.
+- Run only one bot process against the same SQLite database.
+- Use the **same `DATABASE_PATH`** as your current deployment to preserve users, tokens, PRO status, and history.
